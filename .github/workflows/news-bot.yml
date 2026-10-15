@@ -1,0 +1,40 @@
+name: news-bot
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # каждые ~10 минут (GitHub может задерживать на несколько минут)
+  workflow_dispatch:          # кнопка ручного запуска
+
+permissions:
+  contents: write             # чтобы бот мог сохранять seen.json
+
+concurrency:
+  group: news-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python news_bot.py --once
+
+      - name: Save state
+        run: |
+          git config user.name "news-bot"
+          git config user.email "news-bot@users.noreply.github.com"
+          if [ -f seen.json ]; then git add seen.json; fi
+          git diff --cached --quiet || (git commit -m "update seen" && git push)
