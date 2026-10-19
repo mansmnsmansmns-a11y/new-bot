@@ -1,15 +1,19 @@
 """
 IT-новостной бот для Телеграма. Читает RSS русских и казахских IT-источников,
-отбирает только то, что про IT, и шлёт по одной новости в формате поста:
-картинка + заголовок с эмодзи + короткие абзацы + хэштеги. Без ссылок.
+оставляет только новости про выбранные компании (Google, Apple, Microsoft, OpenAI,
+Tesla, Samsung, Intel, AMD) и новинки инструментов для разработчиков, и шлёт
+по одной новости в формате поста: картинка + заголовок с эмодзи + короткие
+абзацы + хэштеги. Без ссылок.
 
 Режимы:
   python news_bot.py          работает постоянно (на компе)
   python news_bot.py --once   одна проверка и выход (для GitHub Actions)
   python news_bot.py --check  проверить ленты, ничего не отправляя
+  python news_bot.py --test   тест: по новости раз в минуту, берёт и старые (до 7 дней)
 
 Токен и chat_id берутся из settings.txt рядом со скриптом
 или из переменных окружения BOT_TOKEN и CHAT_ID.
+chat_id получателя: тот, кому бот должен слать новости (он обязан нажать /start у бота).
 Зависимости: pip install requests
 """
 import html
@@ -56,43 +60,64 @@ FIRST_RUN_PER_FEED = 3       # при самом первом запуске б�
 QUEUE_MAX = 60               # если накопилось больше, самые старые выбрасываем
 STARTUP_PING = True          # при запуске прислать сообщение "бот запущен"
 
-# режим --once (GitHub Actions: запуск раз в ~10 минут)
-ONCE_MAX = 1                 # сколько постов слать за один запуск
-ONCE_SEND_CHANCE = 0.6       # шанс, что в этот запуск что-то отправится (случайность)
+# режим --once (GitHub Actions: запуск каждые 20-30 минут)
+DAILY_MIN, DAILY_MAX = 5, 8  # сколько новостей в день (число на каждый день выбирается случайно)
+SEND_WINDOW = (9, 21)        # в какие часы (по UTC_OFFSET) можно слать
+
+# тестовый режим (--test): шлёт новости часто, берёт и старые, основной seen.json не трогает
+TEST_GAP = 60                # пауза между постами, сек
+TEST_AGE_HOURS = 24 * 7      # насколько старые новости разрешено брать (7 дней)
 
 # общее
 MAX_AGE_HOURS = 24           # старше этого не шлём
 DESC_MAX = 600               # максимум символов в описании
-MIN_IT_SCORE = 3             # насколько "про IT" должна быть новость в общих лентах
-UTC_OFFSET = 5               # твой часовой пояс относительно UTC (Казахстан: +5)
-QUIET_HOURS = (0, 8)         # в это время суток шлём без звука
+UTC_OFFSET = 5               # часовой пояс ПОЛУЧАТЕЛЯ относительно UTC (Казахстан: +5)
+QUIET_HOURS = (0, 8)         # в это время суток шлём без звука (режим "на компе")
 
-# "filter": True значит лента общая, берём только то, что прошло проверку на IT.
 # Если указан "site" вместо "url", адрес ленты бот найдёт сам.
+# Фильтр теперь одинаковый для всех лент (см. classify), поэтому поле "filter" не нужно.
 FEEDS = [
-    {"name": "Хабр", "url": "https://habr.com/ru/rss/news/?fl=ru", "filter": False},
-    {"name": "Хабр", "url": "https://habr.com/ru/rss/best/daily/?fl=ru", "filter": False},
-    {"name": "OpenNet", "url": "https://www.opennet.ru/opennews/opennews_all.rss", "filter": False},
-    {"name": "Proglib", "url": "https://proglib.io/feed", "filter": False},
-    {"name": "Хакер", "url": "https://xakep.ru/feed/", "filter": False},
-    {"name": "3DNews", "url": "https://3dnews.ru/news/rss/", "filter": True},
-    {"name": "Digital Business", "site": "https://digitalbusiness.kz/", "filter": True},
-    {"name": "Digital Business", "site": "https://digitalbusiness.kz/kk/", "filter": True},
+    {"name": "Хабр", "url": "https://habr.com/ru/rss/news/?fl=ru"},
+    {"name": "Хабр", "url": "https://habr.com/ru/rss/best/daily/?fl=ru"},
+    {"name": "OpenNet", "url": "https://www.opennet.ru/opennews/opennews_all.rss"},
+    {"name": "Proglib", "url": "https://proglib.io/feed"},
+    {"name": "Хакер", "url": "https://xakep.ru/feed/"},
+    {"name": "3DNews", "url": "https://3dnews.ru/news/rss/"},
+    {"name": "Digital Business", "site": "https://digitalbusiness.kz/"},
+    {"name": "Digital Business", "site": "https://digitalbusiness.kz/kk/"},
 ]
 
-# слова, по которым новость считается IT (для общих лент)
-IT_WORDS = re.compile(
-    r"программ|разработ|кибер|хакер|взлом|уязвим|утечк|нейросет|искусственн\w* интеллект|"
-    r"\bии\b|\bai\b|\bit\b|\bит\b|ит-|it-|python|javascript|github|openai|chatgpt|\bllm\b|"
-    r"linux|android|\bios\b|софт|алгоритм|стартап|приложени|блокчейн|облак|дата-центр|"
-    r"процессор|видеокарт|nvidia|\bчип|\bapi\b|открыт\w+ код|opensource|\bкод\b|сервер|"
-    r"фреймворк|баз\w+ данных|жасанды интеллект|бағдарлам|киберқауіпсіздік|цифрлық",
-    re.I,
-)
 # слова, из-за которых новость отбрасывается (не про IT)
 NOT_IT = re.compile(
     r"политик|депутат|выбор[ыов]|футбол|хоккей|чемпионат|курс (?:доллара|тенге|валют)|"
     r"погод|\bдтп\b|убит|пожар|приговор|тюрьм|инфляц|пенси|гороскоп|рецепт",
+    re.I,
+)
+
+# выбранные компании: название -> слова, по которым новость про неё
+COMPANY_RE = {name: re.compile(p, re.I) for name, p in {
+    "Google":    r"google|гугл|gemini|android|андроид|youtube|ютуб|chrome|deepmind|pixel",
+    "Apple":     r"\bapple\b|эппл|айфон|iphone|ipad|macbook|macos|\bios\b|vision pro",
+    "Microsoft": r"microsoft|майкрософт|windows|виндовс|copilot|копилот|azure|xbox|github|гитхаб|vs ?code|visual studio",
+    "OpenAI":    r"openai|опенэй|chatgpt|чат-?gpt|sam altman|альтман|\bgpt|\bsora\b",
+    "Tesla":     r"tesla|тесла|cybertruck|optimus",
+    "Samsung":   r"samsung|самсунг|galaxy",
+    "Intel":     r"\bintel\b|\bинтел\b|core ultra",
+    "AMD":       r"\bamd\b|\bамд\b|ryzen|radeon|epyc",
+}.items()}
+
+# инструменты и технологии для айтишников
+DEV_TOOLS = re.compile(
+    r"github|гитхаб|copilot|копилот|vs ?code|visual studio|jetbrains|intellij|pycharm|cursor|"
+    r"\bpython\b|\brust\b|typescript|javascript|golang|docker|kubernetes|linux|ubuntu|"
+    r"\bapi\b|\bsdk\b|фреймворк|framework|компилятор|open ?source|открыт\w+ код|devops|"
+    r"ии-агент|\bmcp\b|\bide\b",
+    re.I,
+)
+# признак того, что это именно новинка/релиз, а не просто упоминание
+NOVELTY = re.compile(
+    r"вышел|вышла|вышло|релиз|нов\w+ (?:функци|верси|возможност)|добавил|появил|"
+    r"представил|запустил|анонсир|обновлени|обновил|фич|выпустил",
     re.I,
 )
 
@@ -133,6 +158,7 @@ def load_seen() -> set:
 
 
 def save_seen(seen: set) -> None:
+    # записи "~sent:..." (счётчик отправленных за день) сортируются в конец и сохраняются
     SEEN_FILE.write_text(json.dumps(sorted(seen)[-5000:]), encoding="utf-8")
 
 
@@ -252,13 +278,29 @@ def load_feed(feed: dict) -> list:
         raise
 
 
-# ------------------------- отбор "про IT" -------------------------
-def is_it(item: dict) -> bool:
-    if NOT_IT.search(item["title"]):
+# ------------------- отбор: выбранные компании и dev-новинки -------------------
+def classify(item: dict) -> bool:
+    """Оставляет только новости про выбранные компании или новинки для разработчиков.
+    Заодно записывает в item["company"] и item["score"] (чем выше, тем важнее)."""
+    title, text = item["title"], item["text"]
+    if NOT_IT.search(title):
         return False
-    title_hits = {w.lower() for w in IT_WORDS.findall(item["title"])}
-    text_hits = {w.lower() for w in IT_WORDS.findall(item["text"])}
-    return 2 * len(title_hits) + len(text_hits) >= MIN_IT_SCORE
+    best, best_score = None, 0
+    for name, rx in COMPANY_RE.items():
+        in_title = len(rx.findall(title))
+        in_text = len(rx.findall(text))
+        if in_title or in_text >= 2:
+            score = 3 * in_title + in_text
+            if score > best_score:
+                best, best_score = name, score
+    if best:
+        item["company"], item["score"] = best, best_score
+        return True
+    dev_hits = len(DEV_TOOLS.findall(title))
+    if dev_hits and NOVELTY.search(title + " " + text):
+        item["company"], item["score"] = None, 2 * dev_hits
+        return True
+    return False
 
 
 def collect_new(seen: set, queued: set, first_run: bool) -> list:
@@ -277,8 +319,7 @@ def collect_new(seen: set, queued: set, first_run: bool) -> list:
             if i["id"] not in seen and i["id"] not in queued and i["id"] not in ids
             and (i["date"] is None or i["date"] >= cutoff)
         ]
-        if feed["filter"]:
-            fresh = [i for i in fresh if is_it(i)]
+        fresh = [i for i in fresh if classify(i)]
         fresh.sort(key=lambda i: i["date"] or datetime.now(timezone.utc), reverse=True)
         if first_run:
             fresh = fresh[:FIRST_RUN_PER_FEED]
@@ -312,6 +353,8 @@ def pick_topics(text: str):
 
 def build_caption(item: dict) -> str:
     emoji, tags = pick_topics(item["title"] + " " + item["text"])
+    if item.get("company"):
+        tags = ["#" + item["company"]] + [t for t in tags if t != "#" + item["company"]]
     title = html.escape(trim(item["title"], 250))
     sentences = [s for s in re.split(r"(?<=[.!?…])\s+", item["text"]) if s]
     if sentences and sentences[0].lower().startswith(item["title"].lower()[:40]):
@@ -407,39 +450,90 @@ def check_feeds() -> None:
     for feed in FEEDS:
         try:
             items = load_feed(feed)
+            matched = sum(1 for i in items if classify(i))
             example = items[0]["title"][:70] if items else "-"
-            print(f"OK    {feed['name']}: {len(items)} шт. | {feed['url']} | {example}")
+            print(f"OK    {feed['name']}: {len(items)} шт., подходит {matched} | {feed['url']} | {example}")
         except Exception as e:
             print(f"FAIL  {feed['name']}: {e}")
 
 
 def run_once() -> None:
-    """Одна проверка: найти свежее про IT, отправить до ONCE_MAX постов, выйти."""
+    """Один запуск: слать не больше одного поста, укладываясь в дневную норму."""
+    setup_logging(to_file=False)
+    require_settings()
+    now = datetime.now(timezone(timedelta(hours=UTC_OFFSET)))
+    day = now.strftime("%Y-%m-%d")
+    start, end = SEND_WINDOW
+    if not (start <= now.hour < end):
+        log.info("Вне окна отправки, выходим")
+        return
+
+    seen = load_seen()
+    sent_today = sum(1 for s in seen if s.startswith(f"~sent:{day}:"))
+    target = random.Random(day).randint(DAILY_MIN, DAILY_MAX)
+    if sent_today >= target:
+        log.info("Дневная норма выполнена: %d из %d", sent_today, target)
+        return
+    # равномерно растягиваем отправку на окно: к концу окна должна набраться норма
+    elapsed = (now.hour + now.minute / 60 - start) / (end - start)
+    due = min(target, int(target * elapsed) + 1)
+    if sent_today >= due:
+        log.info("Пока рано: отправлено %d, по графику %d (норма %d)", sent_today, due, target)
+        return
+
+    new = collect_new(seen, set(), first_run=False)
+    if not new:
+        log.info("Подходящих новостей нет")
+        return
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    new.sort(key=lambda i: (i["score"], i["date"] or floor), reverse=True)
+    log.info("Подходящих неотправленных: %d", len(new))
+
+    for item in new:
+        seen.add(item["id"])
+        try:
+            send_post(item)
+        except Exception as e:
+            log.warning("Не отправилось «%s»: %s", item["title"], e)
+            continue
+        seen.add(f"~sent:{day}:{sent_today + 1}")
+        log.info("Отправлено [%s]: %s", item.get("source"), item["title"])
+        break
+    save_seen(seen)
+
+
+def run_test() -> None:
+    """Тест: слать по одной новости раз в TEST_GAP секунд, брать и старые (до 7 дней).
+    Использует отдельный seen_test.json, основной seen.json не трогает. Остановка: Ctrl+C."""
+    global MAX_AGE_HOURS, SEEN_FILE
+    MAX_AGE_HOURS = TEST_AGE_HOURS
+    SEEN_FILE = Path("seen_test.json")
     setup_logging(to_file=False)
     require_settings()
     seen = load_seen()
-    new = collect_new(seen, set(), first_run=False)
-    new.sort(key=lambda i: i["date"] or datetime.now(timezone.utc), reverse=True)
-    if not new:
-        log.info("Новых IT-новостей нет")
-        return
-    log.info("Свежих неотправленных: %d", len(new))
-    if random.random() > ONCE_SEND_CHANCE:
-        log.info("В этот раз пропускаем (случайная пауза)")
-        return
-    sent = 0
-    for item in new:
-        if sent >= ONCE_MAX:
-            break
+    queue = []
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    log.info("ТЕСТ: по одной новости раз в %d с, возраст новостей до %d ч. Остановка: Ctrl+C",
+             TEST_GAP, TEST_AGE_HOURS)
+    while True:
+        if not queue:
+            queue = collect_new(seen, set(), first_run=False)
+            queue.sort(key=lambda i: (i["score"], i["date"] or floor), reverse=True)
+            log.info("Подходящих новостей в очереди: %d", len(queue))
+            if not queue:
+                time.sleep(TEST_GAP)
+                continue
+        item = queue.pop(0)
+        seen.add(item["id"])
         try:
             send_post(item)
-            sent += 1
             log.info("Отправлено [%s]: %s", item.get("source"), item["title"])
         except Exception as e:
             log.warning("Не отправилось «%s»: %s", item["title"], e)
-        seen.add(item["id"])
-        time.sleep(1.5)
-    save_seen(seen)
+            save_seen(seen)
+            continue
+        save_seen(seen)
+        time.sleep(TEST_GAP)
 
 
 def run_forever() -> None:
@@ -500,5 +594,7 @@ if __name__ == "__main__":
         check_feeds()
     elif "--once" in sys.argv:
         run_once()
+    elif "--test" in sys.argv:
+        run_test()
     else:
         run_forever()
